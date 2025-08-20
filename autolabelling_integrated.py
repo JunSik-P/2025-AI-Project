@@ -1,113 +1,93 @@
 import os
 import shutil
+import glob
 import random
-from pathlib import Path
 import yaml
-from ultralytics import YOLO
+from ultralytics import YOLO  # YOLOv8 기준 (YOLOv5도 사용 가능)
 
-# === 사용자 설정 ===
-IMAGES_DIR = Path(r"C:\Users\User\Desktop\images_all")     # 전체 이미지
-SAMPLE_DIR = Path(r"C:\Users\User\Desktop\sample_labels")  # 샘플 라벨링 (img+txt)
-DATASET_DIR = Path(r"C:\Users\User\Desktop\dataset_tmp")   # 임시 학습용 dataset
-VAL_RATIO = 0.2
-SEED = 42
-EPOCHS = 50
-BATCH = 16
-IMG_SIZE = 640
+# ============ 사용자 입력 ============
+PROJECT_DIR = "project"
+TARGET_CLASS = "bottle"   # 🔥 여기만 바꿔서 원하는 클래스 지정
+IMG_EXTS = [".jpg", ".png", ".jpeg"]
+# ===================================
 
-# === 내부 유틸 ===
-def collect_pairs(img_dir: Path, lbl_dir: Path):
-    img_exts = {".jpg", ".jpeg", ".png"}
-    images = [p for p in img_dir.iterdir() if p.suffix.lower() in img_exts]
-    pairs = []
-    for img in images:
-        lbl = lbl_dir / (img.stem + ".txt")
-        if lbl.exists():
-            pairs.append((img, lbl))
-    return pairs
+# 경로 설정
+images_path = os.path.join(PROJECT_DIR, "images", TARGET_CLASS)
+labels_path = os.path.join(PROJECT_DIR, "labels", TARGET_CLASS)
+dataset_tmp_root = os.path.join(PROJECT_DIR, "dataset_tmp")
+dataset_tmp_class = os.path.join(dataset_tmp_root, f"dataset_tmp_{TARGET_CLASS}")
 
-def split_pairs(pairs, val_ratio=0.2, seed=42):
-    rnd = random.Random(seed)
-    rnd.shuffle(pairs)
-    n_val = max(1, int(len(pairs)*val_ratio))
-    return pairs[n_val:], pairs[:n_val]
+# dataset_tmp 폴더 초기화
+if os.path.exists(dataset_tmp_class):
+    shutil.rmtree(dataset_tmp_class)
+os.makedirs(os.path.join(dataset_tmp_class, "images/train"), exist_ok=True)
+os.makedirs(os.path.join(dataset_tmp_class, "images/val"), exist_ok=True)
+os.makedirs(os.path.join(dataset_tmp_class, "labels/train"), exist_ok=True)
+os.makedirs(os.path.join(dataset_tmp_class, "labels/val"), exist_ok=True)
 
-def copy_pairs(pairs, img_dst: Path, lbl_dst: Path):
-    img_dst.mkdir(parents=True, exist_ok=True)
-    lbl_dst.mkdir(parents=True, exist_ok=True)
-    for img, lbl in pairs:
-        shutil.copy2(img, img_dst / img.name)
-        shutil.copy2(lbl, lbl_dst / lbl.name)
+# 1. train/val 분할
+all_images = [f for f in glob.glob(os.path.join(images_path, "*")) if os.path.splitext(f)[1].lower() in IMG_EXTS]
+random.shuffle(all_images)
+split_idx = int(0.8 * len(all_images))
+train_images, val_images = all_images[:split_idx], all_images[split_idx:]
 
-def write_data_yaml(dataset_root: Path, class_names):
-    yaml_path = dataset_root / "data.yaml"
-    with open(yaml_path, "w", encoding="utf-8") as f:
-        f.write(f"path: {dataset_root.as_posix()}\n")
-        f.write("train: images/train\n")
-        f.write("val: images/val\n")
-        f.write("names:\n")
-        for i, name in enumerate(class_names):
-            f.write(f"  {i}: {name}\n")
-    return yaml_path
+def copy_with_label(img_list, split):
+    for img_file in img_list:
+        base = os.path.basename(img_file)
+        name, _ = os.path.splitext(base)
+        label_file = os.path.join(labels_path, f"{name}.txt")
 
-# === 메인 파이프라인 ===
-def main():
-    # 1) 샘플 라벨링 데이터셋 준비
-    pairs = collect_pairs(SAMPLE_DIR, SAMPLE_DIR)
-    train_pairs, val_pairs = split_pairs(pairs, VAL_RATIO, SEED)
+        shutil.copy(img_file, os.path.join(dataset_tmp_class, f"images/{split}", base))
+        if os.path.exists(label_file):
+            shutil.copy(label_file, os.path.join(dataset_tmp_class, f"labels/{split}", f"{name}.txt"))
 
-    train_img = DATASET_DIR/"images"/"train"
-    train_lbl = DATASET_DIR/"labels"/"train"
-    val_img   = DATASET_DIR/"images"/"val"
-    val_lbl   = DATASET_DIR/"labels"/"val"
+copy_with_label(train_images, "train")
+copy_with_label(val_images, "val")
 
-    copy_pairs(train_pairs, train_img, train_lbl)
-    copy_pairs(val_pairs,   val_img,   val_lbl)
+# 2. data.yaml 생성
+data_yaml = {
+    "train": os.path.join(dataset_tmp_class, "images/train"),
+    "val": os.path.join(dataset_tmp_class, "images/val"),
+    "nc": 1,
+    "names": [TARGET_CLASS]
+}
+with open(os.path.join(dataset_tmp_class, "data.yaml"), "w") as f:
+    yaml.dump(data_yaml, f)
 
-    # 클래스 이름은 샘플 라벨 txt에서 추출할 수 있으나,
-    # 여기서는 폴더명이 클래스명이라고 가정
-    CLASS_NAMES = [SAMPLE_DIR.name]
-    data_yaml = write_data_yaml(DATASET_DIR, CLASS_NAMES)
+print(f"[INFO] YOLO dataset created at {dataset_tmp_class}")
 
-    # 2) YOLO 학습
-    model = YOLO("yolov8n.pt")  # 가벼운 사전학습 모델로 시작
-    results = model.train(
-        data=str(data_yaml),
-        epochs=EPOCHS,
-        batch=BATCH,
-        imgsz=IMG_SIZE,
-        seed=SEED
-    )
-    best_weight = Path(model.trainer.best)
+# 3. YOLO 학습
+model = YOLO("yolov8n.pt")  # YOLOv8n 사전학습 모델 사용 (작고 빠름)
+model.train(data=os.path.join(dataset_tmp_class, "data.yaml"), epochs=50, imgsz=640)
 
-    # 3) 샘플에 없는 나머지 이미지 자동 라벨링
-    all_imgs = {p.name: p for p in IMAGES_DIR.iterdir() if p.suffix.lower() in [".jpg",".jpeg",".png"]}
-    labeled_imgs = {p.name for p, _ in pairs}
-    unlabeled = [all_imgs[n] for n in all_imgs if n not in labeled_imgs]
+# 4. 자동 라벨링 수행 (샘플 라벨 제외한 나머지)
+results = model.predict(source=images_path, save=False)
 
-    if unlabeled:
-        print(f"[i] 자동 라벨링 시작 ({len(unlabeled)}개)")
-        pred_dir = SAMPLE_DIR/"pred_tmp"
-        model = YOLO(best_weight)
-        model.predict(
-            source=[str(p) for p in unlabeled],
-            conf=0.25,
-            iou=0.6,
-            imgsz=IMG_SIZE,
-            save_txt=True,
-            save_conf=False,
-            project=str(pred_dir),
-            name="labels",
-            exist_ok=True
-        )
-        # 4) 생성된 라벨 이동 → SAMPLE_DIR
-        gen_lbl_dir = next((pred_dir/"labels").glob("*"), None)
-        if gen_lbl_dir and gen_lbl_dir.exists():
-            for txt in gen_lbl_dir.glob("*.txt"):
-                shutil.move(str(txt), SAMPLE_DIR/txt.name)
-        shutil.rmtree(pred_dir, ignore_errors=True)
+# 5. 라벨 저장
+for r in results:
+    img_name = os.path.basename(r.path)
+    name, _ = os.path.splitext(img_name)
+    label_file = os.path.join(labels_path, f"{name}.txt")
 
-    print("[✓] 최종 라벨링 완료. SAMPLE_DIR 안에 전체 라벨 확보.")
+    with open(label_file, "w") as f:
+        for box in r.boxes.xywhn.tolist():  # xywh normalized
+            cls = 0  # 단일 클래스
+            x, y, w, h = box
+            f.write(f"{cls} {x} {y} {w} {h}\n")
 
-if __name__ == "__main__":
-    main()
+print(f"[INFO] Labels saved at {labels_path}")
+
+# 6. 검증: 라벨 박스 개수 체크
+problem_cases = []
+for txt_file in glob.glob(os.path.join(labels_path, "*.txt")):
+    with open(txt_file, "r") as f:
+        lines = f.readlines()
+    if len(lines) != 1:
+        problem_cases.append((os.path.basename(txt_file), len(lines)))
+
+if problem_cases:
+    print("\n[WARNING] Some images have abnormal label counts:")
+    for fname, cnt in problem_cases:
+        print(f"  - {fname}: {cnt} boxes")
+else:
+    print("\n[INFO] All images have exactly 1 label box ✅")
