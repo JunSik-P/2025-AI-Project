@@ -26,6 +26,7 @@ def extract_frames_fixed_count(video_path, output_dir, prefix, target_frames):
 
     cap.release()
     print(f"[✓] {prefix}: {saved} frames saved to {output_dir}")
+    print("hello")
 
 
 # === 영상 바로 들어있는 경우 ===
@@ -50,3 +51,4 @@ else:
             prefix,
             target_frames=per_video_frame
         )
+
