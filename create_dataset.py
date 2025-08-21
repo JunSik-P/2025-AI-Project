@@ -2,7 +2,7 @@ import os
 import shutil
 import random
 from pathlib import Path
-import yaml  # (지금은 읽기엔 사용하지 않지만, 추후 확장 대비해서 유지)
+import yaml  # (지금은 읽기엔 사용하지 않지만, 추후 확장 대비 해서 유지)
 
 # === 사용자 설정 ===
 ROOT_SRC = r"C:\Users\User\Desktop\jo\PROJECT\labelling1400"   # 하위폴더들이 있는 루트
@@ -236,3 +236,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
