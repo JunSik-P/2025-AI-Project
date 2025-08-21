@@ -2,12 +2,13 @@ import os
 import shutil
 import random
 from pathlib import Path
-import yaml  # ← YAML 파싱
+import yaml  # (지금은 읽기엔 사용하지 않지만, 추후 확장 대비해서 유지)
 
 # === 사용자 설정 ===
-ROOT_SRC = r"C:\Users\User\Desktop\jo\2025 project\labelling1400"   # 하위폴더들이 있는 루트
-DATASET_DIR = r"C:\Users\User\Desktop\jo\2025 project\dataset_custom" # 최종 dataset 루트
-USE_FOLDERS = ["magazine", "bottle"]  # ✅ 내가 사용할 하위폴더(클래스명)만 지정
+ROOT_SRC = r"C:\Users\User\Desktop\jo\PROJECT\labelling1400"   # 하위폴더들이 있는 루트
+DATASET_DIR = r"C:\Users\User\Desktop\jo\PROJECT\dataset"      # 최종 dataset 루트
+USE_FOLDERS = ["magazine", "bottle", "boots_black", "boots_brown", "bulletproof_plate",
+               "canteen", "gas_mask", "gas_mask_pouch", "helmet", "MRE"]  # 사용할 클래스(폴더)들
 VAL_RATIO = 0.2
 SEED = 42
 COPY = True  # True=복사, False=이동
@@ -17,13 +18,19 @@ def _has_valid_label(txt_path: Path) -> bool:
     if not txt_path.exists() or txt_path.suffix.lower() != ".txt":
         return False
     try:
-        content = txt_path.read_text(encoding="utf-8").strip()
+        # BOM이 있더라도 안전하게 읽기
+        content = txt_path.read_text(encoding="utf-8-sig").strip()
         if not content:
             return False
         for line in content.splitlines():
-            parts = line.strip().split()
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                # 빈 줄/주석 라인은 무시
+                continue
+            parts = raw.split()
             if len(parts) < 5:
                 return False
+            # 앞 5개 토큰이 숫자로 파싱되는지만 확인 (class cx cy w h)
             _ = [float(x) for x in parts[0:5]]
         return True
     except Exception:
@@ -98,67 +105,68 @@ def write_data_yaml(dataset_root: Path, class_names):
             f.write(f"  {i}: {name}\n")
     print(f"[✓] data.yaml 생성 → {yaml_path}")
 
-def _load_names_from_yaml(yaml_path: Path):
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    names = cfg.get("names")
-    if isinstance(names, dict):
-        # {0:'a',1:'b'} 형태 지원
-        # 키가 문자열일 수도 있으니 정렬 시 int 변환 시도
-        def _to_int(k):
-            try:
-                return int(k)
-            except:
-                return k
-        names = [names[k] for k in sorted(names.keys(), key=_to_int)]
-    assert isinstance(names, (list, tuple)), "[!] data.yaml의 names가 올바르지 않습니다."
-    return list(names)
-
-def relabel_from_yaml(yaml_path: Path, lbl_to_class_map):
+# === 핵심: YAML을 다시 읽지 않고 즉석 매핑으로 교정 ===
+def relabel_with_map(lbl_to_class_map, class_to_id: dict):
     """
     lbl_to_class_map: [(dst_label_path: Path, class_name: str), ...]
-    data.yaml의 names를 읽어 name->id 매핑을 만든 뒤,
-    각 라벨(txt)의 첫 숫자(클래스 id)를 해당 class_name의 id로 교정.
+    class_to_id: {'magazine': 0, 'bottle': 1, ...}  # USE_FOLDERS 순서 그대로
     """
-    names = _load_names_from_yaml(yaml_path)
-    name_to_id = {str(n): i for i, n in enumerate(names)}
-    # 대소문자/공백 대비 소문자 trim 매핑도 준비(유연하게)
-    norm = lambda s: str(s).strip().lower()
-    name_to_id_norm = {norm(k): v for k, v in name_to_id.items()}
+    def norm(s: str) -> str:
+        # 대소문자/공백/하이픈/언더스코어 차이를 흡수
+        return str(s).strip().lower().replace(" ", "").replace("-", "_")
+
+    # 원문 키 + 정규화 키 모두 지원
+    class_to_id_norm = {norm(k): v for k, v in class_to_id.items()}
 
     changed, skipped = 0, 0
     for txt_path, cname in lbl_to_class_map:
-        target_id = name_to_id.get(cname)
-        if target_id is None:
-            target_id = name_to_id_norm.get(norm(cname))
-        if target_id is None:
-            print(f"[!] data.yaml에 '{cname}'가 없습니다. 라벨 교정 스킵 → {txt_path.name}")
+        cid = class_to_id.get(cname)
+        if cid is None:
+            cid = class_to_id_norm.get(norm(cname))
+
+        if cid is None:
+            print(f"[!] 클래스 매핑에 '{cname}' 없음 → 스킵: {txt_path}")
+            skipped += 1
+            continue
+
+        if not txt_path.exists():
+            print(f"[!] 라벨 파일 없음 → 스킵: {txt_path}")
             skipped += 1
             continue
 
         lines_out = []
-        with open(txt_path, "r", encoding="utf-8") as f:
+        with open(txt_path, "r", encoding="utf-8-sig") as f:  # BOM 안전
             for line in f:
-                parts = line.strip().split()
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    lines_out.append(line.rstrip("\n"))
+                    continue
+                parts = raw.split()
                 if len(parts) >= 5:
-                    # 해당 파일은 단일 클래스라 가정하고 모든 라인 0번 토큰을 target_id로 통일
-                    parts[0] = str(target_id)
+                    parts[0] = str(cid)
                     lines_out.append(" ".join(parts))
                 else:
-                    # 형식이 비정상이면 원문 보존
+                    # 형식이 비정상인 줄은 원문 보존
                     lines_out.append(line.rstrip("\n"))
+
         with open(txt_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines_out))
         changed += 1
 
-    print(f"[✓] 라벨 교정 완료: {changed}개 수정 (yaml에 없음으로 스킵 {skipped}개)")
+    print(f"[✓] 라벨 교정 완료: {changed}개 수정 (스킵 {skipped}개)")
+
+def _count_files(dir_path: Path, exts=None):
+    if exts is None:
+        return len([p for p in dir_path.iterdir() if p.is_file()])
+    exts = {e.lower() for e in exts}
+    return len([p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in exts])
 
 def main():
     root_src = Path(ROOT_SRC)
     dataset_root = Path(DATASET_DIR)
 
     # ✅ 클래스 이름은 사용자가 지정한 USE_FOLDERS 로 결정
-    class_names = USE_FOLDERS
+    class_names = list(USE_FOLDERS)  # 순서 고정
     print(f"[i] 사용할 클래스: {class_names}")
 
     all_pairs_with_class = []
@@ -193,23 +201,38 @@ def main():
     val_map   = copy_or_move(val_pairs,   val_img,   val_lbl,   do_copy=COPY)
     print("[✓] 파일 배치 완료.")
 
-    # data.yaml 작성
+    # data.yaml 작성 (학습 편의용)
     write_data_yaml(dataset_root, class_names)
 
-    # data.yaml의 names 기준으로 라벨 파일의 클래스 id 일괄 교정
-    relabel_from_yaml(dataset_root / "data.yaml", train_map + val_map)
+    # 🔁 USE_FOLDERS 순서로 class→id 매핑을 만들고, 모든 라벨의 클래스 인덱스를 교정
+    class_to_id = {name: i for i, name in enumerate(class_names)}
+    relabel_with_map(train_map + val_map, class_to_id)
 
     # 개수 출력
-    n_train_img = len([*train_img.glob("*")])
-    n_train_lbl = len([*train_lbl.glob("*.txt")])
-    n_val_img   = len([*val_img.glob("*")])
-    n_val_lbl   = len([*val_lbl.glob("*.txt")])
+    img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+    n_train_img = _count_files(train_img, img_exts)
+    n_train_lbl = _count_files(train_lbl, {".txt"})
+    n_val_img   = _count_files(val_img,   img_exts)
+    n_val_lbl   = _count_files(val_lbl,   {".txt"})
     print(f"[i] 개수 확인 → train(images/labels)={n_train_img}/{n_train_lbl}, "
           f"val(images/labels)={n_val_img}/{n_val_lbl}")
 
+    # 샘플 3개만 확인 출력
+    sample = (train_map + val_map)[:3]
+    for p, c in sample:
+        if p.exists():
+            print(f"\n=== {p.name} (class='{c}') 앞부분 미리보기 ===")
+            try:
+                with open(p, "r", encoding="utf-8-sig") as f:
+                    for i, line in enumerate(f):
+                        if i >= 3: break
+                        print(line.strip())
+            except Exception as e:
+                print(f"(미리보기 실패: {e})")
+
     print("\n학습 실행 예:")
-    print(f'yolo detect train model=yolo11n.pt data="{(dataset_root / "data.yaml")}" imgsz=640 '
-          f'epochs=200 batch=16 seed=42 patience=30')
+    print(f'yolo detect train model=yolo11n.pt data="{(dataset_root / "data.yaml")}" '
+          f'imgsz=640 epochs=200 batch=16 seed=42 patience=30')
 
 if __name__ == "__main__":
     main()
