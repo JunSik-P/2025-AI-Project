@@ -3,14 +3,10 @@ import cv2
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QHBoxLayout, QVBoxLayout, QGraphicsDropShadowEffect,
     QLabel, QSplitter, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
-    QSizePolicy
+    QSizePolicy, QMenu, QAction, QActionGroup
 )
 from PyQt5.QtGui import QIcon, QImage, QPixmap
-from PyQt5.QtCore import Qt, QPoint, QRect, QTimer, QDateTime, QEvent
-
-# Shared border color for camera boxes & log box
-BORDER_COLOR = "#e7e7e7"
-
+from PyQt5.QtCore import Qt, QPoint, QRect, QTimer, QDateTime, QEvent, QSettings
 
 # --- Draggable top bar (only empty area is draggable; buttons stay clickable) ---
 class TopBar(QWidget):
@@ -20,17 +16,19 @@ class TopBar(QWidget):
         self._drag_pos = QPoint()
         self.setObjectName("topBar")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet("""
-            #topBar {
-                background-color: #f2f2f2;        /* light grey */
+
+    def set_theme(self, colors):
+        # Keeps your bottom divider line
+        self.setStyleSheet(f"""
+            #topBar {{
+                background-color: {colors['topbar']};
                 border-top-left-radius: 15px;
                 border-top-right-radius: 15px;
-                border-bottom: 1px solid rgba(0,0,0,0.08); /* divider */
-            }
+                border-bottom: 1px solid {colors['divider']};
+            }}
         """)
 
     def mousePressEvent(self, event):
-        # start window drag only if clicking empty area (not on a child)
         if event.button() == Qt.LeftButton and self.childAt(event.pos()) is None:
             self._drag_active = True
             self._drag_pos = event.globalPos() - self.window().frameGeometry().topLeft()
@@ -107,15 +105,11 @@ class CameraFeed(QWidget):
         self._last_pixmap = None
 
         self.title_label = QLabel(title)
-        self.title_label.setStyleSheet("font-weight: 600; color: #333; padding: 6px;")
 
         self.view = QLabel()
         self.view.setAlignment(Qt.AlignCenter)
-        self.view.setMinimumSize(240, 135)  # small 16:9-ish minimum
-        self.view.setStyleSheet(
-            f"background:#fafafa; border:1px solid {BORDER_COLOR}; border-radius:8px;"
-        )
-        self.view.setScaledContents(False)  # we scale manually with KeepAspectRatio
+        self.view.setMinimumSize(240, 135)
+        self.view.setScaledContents(False)
 
         # wrap the label in an aspect-ratio box
         self.ar = AspectRatioBox(ratio=aspect_ratio, child=self.view, parent=self)
@@ -136,6 +130,12 @@ class CameraFeed(QWidget):
     def set_aspect_ratio(self, rw, rh):
         self.ar.set_ratio(rw, rh)
         self._render_scaled()
+
+    def set_theme(self, colors):
+        self.title_label.setStyleSheet(f"font-weight:600; color:{colors['text']}; padding:6px;")
+        self.view.setStyleSheet(
+            f"background:{colors['cam_bg']}; border:1px solid {colors['border']}; border-radius:8px;"
+        )
 
     def eventFilter(self, obj, e):
         if obj is self.view and e.type() == QEvent.Resize:
@@ -189,75 +189,85 @@ class FramelessWindow(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
+        # QSettings: org/app names — change if you want different keys/paths
+        self.settings = QSettings("2025-AI-Project", "StorageMonitorUI")
+
         # Default size
         self.resize(1000, 700)
         self.setMinimumSize(self.MIN_W, self.MIN_H)
 
-        self._normal_geometry = None  # remember size/pos before fullscreen
+        self._normal_geometry = None
+        self.current_theme = 'light'
 
-        # --- Inner container (white rounded background) ---
+        # Theme palettes
+        self.themes = {
+            'light': {
+                'bg': 'white',
+                'text': '#202124',
+                'topbar': '#f2f2f2',
+                'divider': 'rgba(0,0,0,0.08)',
+                'border': '#e7e7e7',
+                'cam_bg': '#fafafa',
+                'alt_row': '#fafafa',
+                'header_bg': '#f7f7f7',
+                'grid': '#e7e7e7',
+                'min_hover': 'rgba(0,0,0,0.06)',
+                'min_press': 'rgba(0,0,0,0.12)',
+                'selection': 'rgba(0,0,0,0.12)',
+            },
+            'dark': {
+                'bg': '#1e1e1e',
+                'text': '#e6e6e6',
+                'topbar': '#2a2a2a',
+                'divider': 'rgba(255,255,255,0.12)',
+                'border': '#3a3a3a',
+                'cam_bg': '#111111',
+                'alt_row': '#1a1a1a',
+                'header_bg': '#222222',
+                'grid': '#3a3a3a',
+                'min_hover': 'rgba(255,255,255,0.08)',
+                'min_press': 'rgba(255,255,255,0.16)',
+                'selection': 'rgba(255,255,255,0.16)',
+            }
+        }
+
+        # --- Inner container ---
         self.container = QWidget(self)
         self.container.setObjectName("container")
         self.container.setAttribute(Qt.WA_StyledBackground, True)
-        self.container.setStyleSheet(f"""
-            #container {{
-                background-color: white;
-                border-radius: 15px;
-            }}
 
-            QPushButton {{
-                border: none;
-                background: transparent;
-                border-radius: 6px;      /* rounded hover/press background */
-                padding: 0 2px;          /* tiny inner padding */
-            }}
-
-            #minBtn:hover, #fullBtn:hover {{
-                background-color: rgba(0, 0, 0, 0.06);
-            }}
-            #minBtn:pressed, #fullBtn:pressed {{
-                background-color: rgba(0, 0, 0, 0.12);
-            }}
-
-            #closeBtn:hover {{ background-color: #e81123; }}
-            #closeBtn:pressed {{ background-color: #c50f1f; }}
-
-            /* Log box styling to match camera box border */
-            #logBox {{
-                border: 1px solid {BORDER_COLOR};
-                border-radius: 8px;
-                background: #ffffff;
-                alternate-background-color: #fafafa;
-                gridline-color: {BORDER_COLOR};   /* grid lines color */
-            }}
-            #logBox::item:selected {{
-                background: rgba(0,0,0,0.12);
-            }}
-            #logBox QHeaderView::section {{
-                background: #f7f7f7;
-                border: none;
-                border-right: 1px solid {BORDER_COLOR};  /* vertical separators in header */
-                padding: 6px;
-            }}
-            #logBox QTableCornerButton::section {{
-                background: #f7f7f7;
-                border: none;
-            }}
-        """)
-
-        # Outer margin so the drop shadow isn't clipped
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.addWidget(self.container)
 
-        # Drop shadow
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(24)
         shadow.setOffset(0, 6)
         shadow.setColor(Qt.black)
         self.container.setGraphicsEffect(shadow)
 
-        # --- Buttons ---
+        # --- Top bar buttons ---
+        # Left: Settings (with menu)
+        self.settings_button = QPushButton("")
+        self.settings_button.setObjectName("settingsBtn")
+        self.settings_button.setIcon(QIcon("settings_button.png"))
+        self.settings_button.setCursor(Qt.PointingHandCursor)
+
+        self.theme_menu = QMenu(self.settings_button)
+        self.action_light = QAction("Light theme", self, checkable=True)
+        self.action_dark = QAction("Dark theme", self, checkable=True)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        group.addAction(self.action_light)
+        group.addAction(self.action_dark)
+        self.theme_menu.addAction(self.action_light)
+        self.theme_menu.addAction(self.action_dark)
+        self.settings_button.setMenu(self.theme_menu)
+
+        self.action_light.triggered.connect(lambda: self.apply_theme('light'))
+        self.action_dark.triggered.connect(lambda: self.apply_theme('dark'))
+
+        # Right: Min/Max/Close
         self.min_button = QPushButton("")
         self.min_button.setObjectName("minBtn")
         self.min_button.setIcon(QIcon("minimize_button.png"))
@@ -276,16 +286,17 @@ class FramelessWindow(QWidget):
         self.close_button.clicked.connect(self.close)
         self.close_button.setCursor(Qt.PointingHandCursor)
 
-        # --- Top bar widget (light grey, draggable only in empty area) ---
+        # --- Top bar (draggable in empty area) ---
         self.top_bar_widget = TopBar(self)
         self.top_bar_layout = QHBoxLayout(self.top_bar_widget)
-        self.top_bar_layout.setContentsMargins(8, 6, 6, 6)  # L T R B
+        self.top_bar_layout.setContentsMargins(8, 6, 6, 6)
+        self.top_bar_layout.addWidget(self.settings_button)  # left
         self.top_bar_layout.addStretch()
         self.top_bar_layout.addWidget(self.min_button)
         self.top_bar_layout.addWidget(self.fullsize_button)
         self.top_bar_layout.addWidget(self.close_button)
 
-        # --- CONTENT: Left cameras (resizable, ratio-locked) | Right log (resizable) ---
+        # --- Content: Cameras + Log ---
         self.face_cam = CameraFeed(face_source, "Face Camera", aspect_ratio=ratio)
         self.item_cam = CameraFeed(item_source, "Item Camera", aspect_ratio=ratio)
 
@@ -297,7 +308,6 @@ class FramelessWindow(QWidget):
         cam_layout.addWidget(self.item_cam, 1)
         cameras_col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # Right: log table with Count column
         self.log_table = QTableWidget(0, 5)
         self.log_table.setObjectName("logBox")
         self.log_table.setHorizontalHeaderLabels(["Time", "User", "Action", "Item", "Count"])
@@ -305,29 +315,30 @@ class FramelessWindow(QWidget):
         self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.log_table.setAlternatingRowColors(True)
-        self.log_table.setShowGrid(True)                          # <- show grid
-        self.log_table.setGridStyle(Qt.SolidLine)                 # <- solid lines
+        self.log_table.setShowGrid(True)
+        self.log_table.setGridStyle(Qt.SolidLine)
 
         header = self.log_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
         header.setHighlightSections(False)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Count compact
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
         # Splitter: both sides can grow, left a bit heavier
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(cameras_col)
-        splitter.addWidget(self.log_table)
-        splitter.setStretchFactor(0, 2)  # left grows more
-        splitter.setStretchFactor(1, 1)
+        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter.addWidget(cameras_col)
+        self.splitter.addWidget(self.log_table)
+        self.splitter.setStretchFactor(0, 2)
+        self.splitter.setStretchFactor(1, 1)
+        # Persist sizes when user drags the divider
+        self.splitter.splitterMoved.connect(self._save_splitter_sizes)
 
-        # --- Main layout inside the white container ---
         main_layout = QVBoxLayout(self.container)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         main_layout.addWidget(self.top_bar_widget)
-        main_layout.addWidget(splitter, 1)
+        main_layout.addWidget(self.splitter, 1)
 
-        # --- Resize/drag state (for window frame edges) ---
+        # Resize/drag state
         self._resizing = False
         self._resize_region = None
         self._resize_start_geo = QRect()
@@ -340,6 +351,100 @@ class FramelessWindow(QWidget):
         self._update_button_sizes()
         self._update_topbar_height()
         self._update_topbar_spacing()
+
+        # Load last theme from settings (defaults to 'light')
+        saved_theme = self.settings.value("theme", "light")
+        self.apply_theme(saved_theme)
+
+        # ---- Restore geometry and splitter sizes ----
+        self._restore_geometry_and_splitter()
+
+    # ===== Persistence helpers =====
+    def _restore_geometry_and_splitter(self):
+        geo = self.settings.value("geometry")
+        if geo is not None:
+            self.restoreGeometry(geo)
+
+        sizes = self.settings.value("splitterSizes")
+        if sizes:
+            try:
+                sizes = [int(x) for x in list(sizes)]
+                if len(sizes) == 2 and sum(sizes) > 0:
+                    self.splitter.setSizes(sizes)
+            except Exception:
+                pass
+
+    def _save_splitter_sizes(self, *_):
+        self.settings.setValue("splitterSizes", self.splitter.sizes())
+
+    # ===== Theme application with persistence =====
+    def _container_styles(self, c):
+        return f"""
+            #container {{
+                background-color: {c['bg']};
+                border-radius: 15px;
+                color: {c['text']};
+            }}
+
+            QPushButton {{
+                border: none;
+                background: transparent;
+                border-radius: 6px;
+                padding: 0 2px;
+            }}
+
+            #settingsBtn:hover, #minBtn:hover, #fullBtn:hover {{
+                background-color: {c['min_hover']};
+            }}
+            #settingsBtn:pressed, #minBtn:pressed, #fullBtn:pressed {{
+                background-color: {c['min_press']};
+            }}
+
+            #closeBtn:hover {{ background-color: #e81123; }}
+            #closeBtn:pressed {{ background-color: #c50f1f; }}
+
+            #logBox {{
+                border: 1px solid {c['border']};
+                border-radius: 8px;
+                background: {c['bg']};
+                alternate-background-color: {c['alt_row']};
+                gridline-color: {c['grid']};
+                color: {c['text']};
+            }}
+            #logBox::item:selected {{
+                background: {c['selection']};
+            }}
+            #logBox QHeaderView::section {{
+                background: {c['header_bg']};
+                color: {c['text']};
+                border: none;
+                border-right: 1px solid {c['border']};
+                padding: 6px;
+            }}
+            #logBox QTableCornerButton::section {{
+                background: {c['header_bg']};
+                border: none;
+            }}
+        """
+
+    def apply_theme(self, name):
+        if name not in self.themes:
+            return
+        self.current_theme = name
+        c = self.themes[name]
+
+        # Persist selection
+        self.settings.setValue("theme", name)
+
+        # Update menu check marks
+        self.action_light.setChecked(name == 'light')
+        self.action_dark.setChecked(name == 'dark')
+
+        # Apply styles
+        self.container.setStyleSheet(self._container_styles(c))
+        self.top_bar_widget.set_theme(c)
+        self.face_cam.set_theme(c)
+        self.item_cam.set_theme(c)
 
     # ===== Public API: add a log row (with count) =====
     def add_log(self, user, action, item, count=1):
@@ -476,7 +581,7 @@ class FramelessWindow(QWidget):
     def _update_button_sizes(self):
         base = int(min(self.width(), self.height()) * 0.05)
         base = max(12, min(32, base))
-        for btn in (self.min_button, self.fullsize_button, self.close_button):
+        for btn in (self.settings_button, self.min_button, self.fullsize_button, self.close_button):
             btn.setFixedSize(base, base)
             btn.setIconSize(btn.size())
 
@@ -489,8 +594,13 @@ class FramelessWindow(QWidget):
         gap = max(4, min(12, int(self.min_button.width() * 0.25)))
         self.top_bar_layout.setSpacing(gap)
 
-    # ===== Cleanup =====
     def closeEvent(self, event):
+        # Save geometry & maximized state
+        self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("maximized", self.isMaximized())
+        # Save splitter sizes (again, just in case)
+        self.settings.setValue("splitterSizes", self.splitter.sizes())
+        # Stop cameras cleanly
         self.face_cam.stop()
         self.item_cam.stop()
         super().closeEvent(event)
@@ -499,15 +609,20 @@ class FramelessWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    # Choose default aspect ratio here (e.g., (16,9), (4,3), (1,1), (21,9), ...)
     default_ratio = (16, 9)
-
     w = FramelessWindow(face_source=0, item_source=1, ratio=default_ratio)
 
-    # Example: append a test log row
+    # Restore maximized state AFTER creating the window
+    if w.settings.value("maximized", False, type=bool):
+        w.showMaximized()
+    else:
+        w.show()
+
+    # Example:
     # w.add_log("Alice", "Deposit", "Box-A", 3)
 
-    w.show()
     sys.exit(app.exec_())
 
- # <a target="_blank" href="https://icons8.com/icon/43725/cancel">Cancel</a> icon by <a target="_blank" href="https://icons8.com">Icons8</a>
+ # Settings are stored under org="2025-AI-Project", app="StorageMonitorUI". Change those two strings if you want a different storage key.
+
+ # <a target="_blank" href="https://icons8.com/icon/43725/cancel">Cancel</a> icon by <a target="_blank" href="https://icons8.com">Icons8</a>blank" href="https://icons8.com">Icons8</a>
