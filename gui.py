@@ -1,4 +1,4 @@
-import sys, os, time, logging
+import sys, os, time, logging, random
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import cv2
@@ -6,9 +6,10 @@ import cv2
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QHBoxLayout, QVBoxLayout, QGraphicsDropShadowEffect,
     QLabel, QSplitter, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
-    QSizePolicy, QMenu, QAction, QActionGroup, QInputDialog, QMessageBox
+    QSizePolicy, QMenu, QAction, QActionGroup, QInputDialog, QMessageBox, QDialog, 
+    QLineEdit, QSpinBox, QComboBox, QFormLayout, QPlainTextEdit, QCheckBox
 )
-from PyQt5.QtGui import QIcon, QImage, QPixmap
+from PyQt5.QtGui import QIcon, QImage, QPixmap, QIcon, QImage, QPixmap, QColor, QBrush, QFont
 from PyQt5.QtCore import Qt, QPoint, QRect, QTimer, QDateTime, QEvent, QSettings
 
 APP_ORG = "2025-AI-Project"
@@ -206,7 +207,7 @@ class CameraFeed(QWidget):
         try:
             self.cap = cv2.VideoCapture(self.source)
             if not self.cap or not self.cap.isOpened():
-                self.title_label.setText(f"{self.title} (not found)")
+                self.title_label.setText(f"{self.title} (응답없음)")
                 self._log.error("Cannot open camera source: %r", self.source)
                 return
             self._log.info("Camera started: %r", self.source)
@@ -268,6 +269,161 @@ class CameraFeed(QWidget):
     def closeEvent(self, e):
         self.stop()
         super().closeEvent(e)
+
+
+class DebugConsole(QDialog):
+    def __init__(self, host_window: 'FramelessWindow'):
+        super().__init__(host_window)
+        self.host = host_window
+        self.setWindowTitle("Debug Console")
+        self.setModal(False)
+        self.setMinimumWidth(420)
+
+        # --- Inputs ---
+        self.user_edit = QLineEdit("사용자")
+        self.action_combo = QComboBox()
+        self.action_combo.addItems(["반납", "불출", "경고!"])
+        self.item_edit = QLineEdit("ㅋ")
+        self.count_spin = QSpinBox(); self.count_spin.setRange(1, 999); self.count_spin.setValue(1)
+
+        self.note_edit = QLineEdit("(대충 아주 수상한 재고 불일치가 있다는 내용)")
+
+        self.chk_log_also = QCheckBox("Also add to event log when pushing a notification")
+        self.chk_log_also.setChecked(True)
+
+        form = QFormLayout()
+        form.addRow("이름:", self.user_edit)
+        form.addRow("반납/불출:", self.action_combo)
+        form.addRow("품목:", self.item_edit)
+        form.addRow("수량:", self.count_spin)
+        form.addRow("알림 문구:", self.note_edit)
+        form.addRow("", self.chk_log_also)
+
+        # --- Buttons ---
+        self.btn_add = QPushButton("로그 추가")
+        self.btn_add10 = QPushButton("랜덤으로 10개 추가")
+        self.btn_notify = QPushButton("알림 테스트")
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_add)
+        btn_row.addWidget(self.btn_add10)
+        btn_row.addWidget(self.btn_notify)
+
+        # --- Console output (optional) ---
+        self.out = QPlainTextEdit(); self.out.setReadOnly(True); self.out.setMaximumBlockCount(500)
+
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addLayout(btn_row)
+        lay.addWidget(self.out)
+
+        # Wire
+        self.btn_add.clicked.connect(self._add_one)
+        self.btn_add10.clicked.connect(self._add_ten)
+        self.btn_notify.clicked.connect(self._push_notif)
+
+        # Theme
+        self.apply_theme(self.host.themes[self.host.current_theme])
+
+    def apply_theme(self, colors: dict):
+        self.setStyleSheet(f"""
+            QDialog {{ background: {colors['bg']}; color: {colors['text']}; }}
+            QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {{
+                background: {colors['cam_bg']}; color: {colors['text']};
+                border: 1px solid {colors['border']}; border-radius: 6px; padding: 4px;
+            }}
+            QPushButton {{
+                border: none; background: transparent; padding: 6px 10px; border-radius: 6px;
+            }}
+            QPushButton:hover {{ background: {colors['min_hover']}; }}
+            QPushButton:pressed {{ background: {colors['min_press']}; }}
+        """)
+
+    def _add_one(self):
+        u = self.user_edit.text().strip() or "사용자"
+        a = self.action_combo.currentText()
+        i = self.item_edit.text().strip() or "품목"
+        c = int(self.count_spin.value())
+        self.host.add_log(u, a, i, c)
+        self._log_out(f"add_log({u!r}, {a!r}, {i!r}, {c})")
+
+    def _add_ten(self):
+        users = ["김춘식", "신창섭", "김아무개", "홍길동", "최범수"]
+        items = ["탄알집", "방탄모", "방탄판", "수통", "방독면", "군화(육면)", "군화(은면)"]
+        actions = ["반납", "불출"]
+        for _ in range(10):
+            u = random.choice(users)
+            a = random.choice(actions)
+            i = random.choice(items)
+            c = random.randint(1, 50)
+            self.host.add_log(u, a, i, c)
+        self._log_out("무작위 로그 10개를 추가했습니다.")
+
+    def _push_notif(self):
+        msg = self.note_edit.text().strip() or "(대충 아주 수상한 재고 불일치가 있다는 내용)"
+        self.host.push_notification(msg)
+        self._log_out(f"push_notification({msg!r})")
+        if self.chk_log_also.isChecked():
+            self.host.add_log("SYSTEM", "Alert", msg, 1)
+
+    def _log_out(self, text):
+        self.out.appendPlainText(text)
+
+
+class InventoryDialog(QDialog):
+    def __init__(self, host_window: 'FramelessWindow'):
+        super().__init__(host_window)
+        self.host = host_window
+        self.setWindowTitle("재고 현황")
+        self.setModal(False)
+        self.setMinimumWidth(360)
+
+        self.table = QTableWidget(0, 2, self)
+        self.table.setHorizontalHeaderLabels(["품목", "수량"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.addWidget(self.table)
+
+        self.apply_theme(self.host.themes[self.host.current_theme])
+
+    def apply_theme(self, colors: dict):
+        # match your table style
+        self.setStyleSheet(f"""
+            QDialog {{ background: {colors['bg']}; color: {colors['text']}; }}
+            QTableWidget {{
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+                background: {colors['bg']};
+                alternate-background-color: {colors['alt_row']};
+                gridline-color: {colors['grid']};
+                color: {colors['text']};
+            }}
+            QHeaderView::section {{
+                background: {colors['header_bg']};
+                color: {colors['text']};
+                border: none;
+                border-right: 1px solid {colors['border']};
+                padding: 6px;
+            }}
+        """)
+
+    def set_counts(self, counts: dict):
+        items = sorted(counts.items(), key=lambda kv: (kv[0] or "").lower())
+        self.table.setRowCount(len(items))
+        for r, (name, cnt) in enumerate(items):
+            name_item = QTableWidgetItem(str(name))
+            cnt_item = QTableWidgetItem(str(int(cnt)))
+            cnt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(r, 0, name_item)
+            self.table.setItem(r, 1, cnt_item)
+
 
 # --- Aspect ratio helpers ---
 def parse_ratio_text(s, fallback=(16, 9)):
@@ -362,21 +518,21 @@ class FramelessWindow(QWidget):
         self.settings_menu = QMenu(self.settings_button)
 
         # Theme submenu (radio list like Debug items)
-        self.theme_menu = QMenu("Theme", self.settings_menu)
-        self.action_light = QAction("Light", self, checkable=True)
-        self.action_dark = QAction("Dark", self, checkable=True)
+        self.theme_menu = QMenu("테마", self.settings_menu)
+        self.action_light = QAction("밝은 테마", self, checkable=True)
+        self.action_dark = QAction("어두운 테마", self, checkable=True)
         g_theme = QActionGroup(self); g_theme.setExclusive(True)
         g_theme.addAction(self.action_light); g_theme.addAction(self.action_dark)
         self.theme_menu.addAction(self.action_light)
         self.theme_menu.addAction(self.action_dark)
 
         # Aspect Ratio submenu (presets + Custom…)
-        self.ratio_menu = QMenu("Aspect Ratio", self.settings_menu)
+        self.ratio_menu = QMenu("카메라 비율", self.settings_menu)
         self.action_ratio_169 = QAction("16:9", self, checkable=True)
         self.action_ratio_43  = QAction("4:3",  self, checkable=True)
         self.action_ratio_11  = QAction("1:1",  self, checkable=True)
         self.action_ratio_219 = QAction("21:9", self, checkable=True)
-        self.action_ratio_custom = QAction("Custom…", self)
+        self.action_ratio_custom = QAction("상세 비율…", self)
         g_ratio = QActionGroup(self); g_ratio.setExclusive(True)
         for a in (self.action_ratio_169, self.action_ratio_43, self.action_ratio_11, self.action_ratio_219):
             g_ratio.addAction(a); self.ratio_menu.addAction(a)
@@ -389,16 +545,23 @@ class FramelessWindow(QWidget):
         self.action_show_fps  = QAction("Show FPS overlay", self, checkable=True)
         self.action_restart_cams = QAction("Restart cameras", self)
         self.action_dump_settings = QAction("Dump settings to log", self)
-        self.action_notif_test = QAction("Send test notification", self)
-        self.debug_menu.addAction(self.action_notif_test)
-        self.action_notif_test.triggered.connect(
-            lambda: self.push_notification("Test alert: suspicious activity detected")
-        )
+        self.action_open_debug_console = QAction("Open debug console…", self)
+        # Inventory debug tools
+        self.action_rebuild_counts = QAction("Rebuild inventory counts from log", self)
+        self.action_clear_counts   = QAction("Clear all inventory counts", self)
+        self.action_seed_counts    = QAction("Seed counts manually…", self)
+
         self.debug_menu.addAction(self.action_debug_logs)
         self.debug_menu.addAction(self.action_show_fps)
         self.debug_menu.addSeparator()
         self.debug_menu.addAction(self.action_restart_cams)
         self.debug_menu.addAction(self.action_dump_settings)
+        self.debug_menu.addSeparator()
+        self.debug_menu.addAction(self.action_open_debug_console)
+        self.debug_menu.addSeparator()
+        self.debug_menu.addAction(self.action_rebuild_counts)
+        self.debug_menu.addAction(self.action_clear_counts)
+        self.debug_menu.addAction(self.action_seed_counts)
 
         # Assemble the Settings menu on the button
         self.settings_menu.addMenu(self.theme_menu)
@@ -422,6 +585,13 @@ class FramelessWindow(QWidget):
         self.action_show_fps.toggled.connect(self._on_toggle_fps)
         self.action_restart_cams.triggered.connect(self._on_restart_cameras)
         self.action_dump_settings.triggered.connect(self._on_dump_settings)
+        self.action_open_debug_console.triggered.connect(self._open_debug_console)
+        self._debug_console = None
+
+        self.action_rebuild_counts.triggered.connect(self._rebuild_counts_from_log)
+        self.action_clear_counts.triggered.connect(self._clear_counts)
+        self.action_seed_counts.triggered.connect(self._seed_counts_prompt)
+
 
 
         # Right: Min/Max/Close
@@ -451,13 +621,13 @@ class FramelessWindow(QWidget):
 
         # Notifications menu
         self.notifications_menu = QMenu(self.notifications_button)
-        self._notif_title = QAction("Notifications", self)
+        self._notif_title = QAction("알림 목록", self)
         self._notif_title.setEnabled(False)
         self._notif_separator = self.notifications_menu.addSeparator()  # anchor to insert above
         self.notifications_menu.insertAction(self._notif_separator, self._notif_title)
 
-        self.action_notif_mark_read = QAction("Mark all as read", self)
-        self.action_notif_clear = QAction("Clear all", self)
+        self.action_notif_mark_read = QAction("전부 읽음처리", self)
+        self.action_notif_clear = QAction("비우기", self)
         self.notifications_menu.addSeparator()
         self.notifications_menu.addAction(self.action_notif_mark_read)
         self.notifications_menu.addAction(self.action_notif_clear)
@@ -479,20 +649,32 @@ class FramelessWindow(QWidget):
         self.action_notif_clear.triggered.connect(self._on_clear_notifications)
 
 
+        # Inventory table button (next to Notifications)
+        self.inventory_button = QPushButton("")
+        self.inventory_button.setObjectName("invBtn")
+        self.inventory_button.setIcon(QIcon("table_button.png"))   # supply an icon file
+        self.inventory_button.setCursor(Qt.PointingHandCursor)
+        self.inventory_button.clicked.connect(self._open_inventory)
+
+        self._inventory_dialog = None
+        self.item_counts = {}  # item -> count (int)
+
+
         # --- Top bar (draggable in empty area) ---
         self.top_bar_widget = TopBar(self)
         self.top_bar_layout = QHBoxLayout(self.top_bar_widget)
         self.top_bar_layout.setContentsMargins(8, 6, 6, 6)
         self.top_bar_layout.addWidget(self.settings_button)
         self.top_bar_layout.addWidget(self.notifications_button)
+        self.top_bar_layout.addWidget(self.inventory_button)
         self.top_bar_layout.addStretch()
         self.top_bar_layout.addWidget(self.min_button)
         self.top_bar_layout.addWidget(self.fullsize_button)
         self.top_bar_layout.addWidget(self.close_button)
 
         # --- Content: Cameras + Log ---
-        self.face_cam = CameraFeed(face_source, "Face Camera", aspect_ratio=ratio)
-        self.item_cam = CameraFeed(item_source, "Item Camera", aspect_ratio=ratio)
+        self.face_cam = CameraFeed(face_source, "안면 인식 카메라", aspect_ratio=ratio)
+        self.item_cam = CameraFeed(item_source, "품목 인식 카메라", aspect_ratio=ratio)
 
         cameras_col = QWidget()
         cam_layout = QVBoxLayout(cameras_col)
@@ -504,7 +686,7 @@ class FramelessWindow(QWidget):
 
         self.log_table = QTableWidget(0, 5)
         self.log_table.setObjectName("logBox")
-        self.log_table.setHorizontalHeaderLabels(["Time", "User", "Action", "Item", "Count"])
+        self.log_table.setHorizontalHeaderLabels(["시간", "이름", "반납/불출", "품목", "수량"])
         self.log_table.verticalHeader().setVisible(False)
         self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -642,6 +824,117 @@ class FramelessWindow(QWidget):
             self.notifications_menu.removeAction(a)
         self._set_unread_badge(0)
 
+    def _open_debug_console(self):
+        if self._debug_console is None:
+            self._debug_console = DebugConsole(self)
+        # sync theme each time before showing
+        self._debug_console.apply_theme(self.themes[self.current_theme])
+        self._debug_console.show()
+        self._debug_console.raise_()
+        self._debug_console.activateWindow()
+
+    def _open_inventory(self):
+        if self._inventory_dialog is None:
+            self._inventory_dialog = InventoryDialog(self)
+        # theme + data
+        self._inventory_dialog.apply_theme(self.themes[self.current_theme])
+        self._inventory_dialog.set_counts(self.item_counts)
+        self._inventory_dialog.show()
+        self._inventory_dialog.raise_()
+        self._inventory_dialog.activateWindow()
+
+    def _update_item_count(self, item_name: str, delta: int):
+        name = (str(item_name) or "").strip()
+        if not name:
+            return
+        self.item_counts[name] = int(self.item_counts.get(name, 0)) + int(delta)
+        # live-refresh if dialog is open
+        if self._inventory_dialog and self._inventory_dialog.isVisible():
+            self._inventory_dialog.set_counts(self.item_counts)
+
+    def _delta_for_action(self, action_text: str, count: int) -> int:
+        a = (str(action_text) or "").strip()
+        if a == "반납":      # deposit/return
+            return +int(count)
+        if a == "불출":      # withdraw
+            return -int(count)
+        # '경고!' or any other action does not change stock
+        return 0
+    
+    def _refresh_inventory_dialog(self):
+        if hasattr(self, "_inventory_dialog") and self._inventory_dialog and self._inventory_dialog.isVisible():
+            self._inventory_dialog.set_counts(self.item_counts)
+    
+    def _rebuild_counts_from_log(self):
+        counts = {}
+        rows = self.log_table.rowCount()
+        for r in range(rows):
+            a_item = self.log_table.item(r, 2)
+            i_item = self.log_table.item(r, 3)
+            c_item = self.log_table.item(r, 4)
+            action_txt = a_item.text() if a_item else ""
+            item_txt   = i_item.text() if i_item else ""
+            try:
+                cnt = int(c_item.text()) if c_item else 0
+            except Exception:
+                cnt = 0
+            delta = self._delta_for_action(action_txt, cnt)  # uses your existing helper
+            if item_txt and delta != 0:
+                counts[item_txt] = int(counts.get(item_txt, 0)) + int(delta)
+    
+        self.item_counts = counts
+        self._refresh_inventory_dialog()
+        QMessageBox.information(self, "Inventory", f"Rebuilt counts from log ({len(counts)} items).")
+    
+    def _clear_counts(self):
+        self.item_counts.clear()
+        self._refresh_inventory_dialog()
+        QMessageBox.information(self, "Inventory", "All inventory counts cleared.")
+    
+    def _seed_counts_prompt(self):
+        # Let user paste something like:
+        #   Box-A=10, Box-B: 5
+        #   Crate-12 7
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Seed counts manually…",
+            "Enter items and counts (examples):\n"
+            "  Box-A=10, Box-B:5\n"
+            "  Crate-12 7\n"
+            "Lines or commas are fine. Only integers are accepted.",
+            ""
+        )
+        if not ok or not text.strip():
+            return
+    
+        updated = 0
+        for chunk in [p.strip() for p in text.replace("\n", ",").split(",")]:
+            if not chunk:
+                continue
+            name, val = None, None
+            # try separators in order: '=', ':', whitespace
+            if "=" in chunk:
+                name, val = chunk.split("=", 1)
+            elif ":" in chunk:
+                name, val = chunk.split(":", 1)
+            else:
+                parts = chunk.split()
+                if len(parts) >= 2:
+                    name, val = " ".join(parts[:-1]), parts[-1]
+            if name is None or val is None:
+                continue
+            name = name.strip()
+            try:
+                cnt = int(val.strip())
+            except Exception:
+                continue
+            if name:
+                self.item_counts[name] = cnt
+                updated += 1
+    
+        self._refresh_inventory_dialog()
+        QMessageBox.information(self, "Inventory", f"Seeded {updated} item(s).")
+
+
 
     # ===== Persistence helpers =====
     def _restore_geometry_and_splitter(self):
@@ -681,10 +974,10 @@ class FramelessWindow(QWidget):
                 padding: 0 2px;
             }}
 
-            #settingsBtn:hover, #minBtn:hover, #fullBtn:hover, #notifBtn:hover {{
+            #settingsBtn:hover, #minBtn:hover, #fullBtn:hover, #notifBtn:hover, #invBtn:hover {{
                 background-color: {c['min_hover']};
             }}
-            #settingsBtn:pressed, #minBtn:pressed, #fullBtn:pressed, #notifBtn:pressed {{
+            #settingsBtn:pressed, #minBtn:pressed, #fullBtn:pressed, #notifBtn:pressed, #invBtn:pressed {{
                 background-color: {c['min_press']};
             }}
 
@@ -733,6 +1026,22 @@ class FramelessWindow(QWidget):
         self.face_cam.set_theme(c)
         self.item_cam.set_theme(c)
         self._log.info("Applied theme: %s", name)
+
+        # Keep debug console and inventory dialog themed too
+        if hasattr(self, "_debug_console") and self._debug_console:
+            self._debug_console.apply_theme(c)
+        if hasattr(self, "_inventory_dialog") and self._inventory_dialog:
+            self._inventory_dialog.apply_theme(c)
+
+
+        # Repaint existing alert rows to match theme
+        for r in range(self.log_table.rowCount()):
+            a = self.log_table.item(r, 2)
+            i = self.log_table.item(r, 3)
+            action_txt = a.text() if a else ""
+            item_txt   = i.text() if i else ""
+            self._paint_log_row(r, self._is_alert_entry("", action_txt, item_txt))
+
 
     def _apply_ratio(self, ratio_tuple, update_menu_checks=False):
         rw, rh = ratio_tuple
@@ -798,6 +1107,50 @@ class FramelessWindow(QWidget):
         self.log_table.setItem(row, 4, count_item)
         self.log_table.scrollToBottom()
         self._log.debug("Log row: %s | %s | %s | %s", ts, user, action, item)
+
+        # highlight alerts (Action or Item equals "경고!" or action == "Alert")
+        self._paint_log_row(row, self._is_alert_entry(user, action, item))
+
+        # --- NEW: inventory count update ---
+        delta = self._delta_for_action(action, count)
+        if delta != 0:
+            self._update_item_count(item, delta)
+
+        # --- NEW: push notification for '경고!' (action or item) ---
+        if str(action).strip() == "경고!" or str(item).strip() == "경고!":
+            self.push_notification(f"[{user}] {item} - 경고 발생")
+
+    def _is_alert_entry(self, user, action, item) -> bool:
+        a = (str(action) or "").strip()
+        i = (str(item) or "").strip()
+        return a == "경고!" or i == "경고!" or a.lower() == "alert"
+
+    def _paint_log_row(self, row: int, alert: bool):
+        # Choose colors per theme
+        if alert:
+            if self.current_theme == "dark":
+                bg = QColor("#4a1214")   # dark red-ish
+                fg = QColor("#ffcdd2")   # soft pink text
+            else:
+                bg = QColor("#ffebee")   # light red-ish
+                fg = QColor("#b71c1c")   # deep red text
+            bold = True
+        else:
+            bg = QColor(0, 0, 0, 0)      # transparent -> use normal alt row colors
+            fg = None
+            bold = False
+
+        for col in range(self.log_table.columnCount()):
+            it = self.log_table.item(row, col)
+            if not it:
+                continue
+            it.setBackground(QBrush(bg))
+            if fg:
+                it.setForeground(QBrush(fg))
+            f = it.font()
+            f.setBold(bold)
+            it.setFont(f)
+
 
     # ===== Fullscreen toggle =====
     def toggle_fullscreen(self):
@@ -919,7 +1272,7 @@ class FramelessWindow(QWidget):
     def _update_button_sizes(self):
         base = int(min(self.width(), self.height()) * 0.05)
         base = max(12, min(32, base))
-        for btn in (self.settings_button, self.notifications_button, self.min_button, self.fullsize_button, self.close_button):
+        for btn in (self.settings_button, self.notifications_button, self.inventory_button, self.min_button, self.fullsize_button, self.close_button):
             btn.setFixedSize(base, base)
             btn.setIconSize(btn.size())
         self._position_notif_badge()  # keep badge in the bottom-right corner
