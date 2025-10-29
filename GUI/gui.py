@@ -19,9 +19,46 @@ APP_ORG = "2025-AI-Project"
 APP_NAME = "StorageMonitorUI"
 LOG_DIR = Path.home() / ".storage_monitor_ui"
 
-# ===== 파일 경로 (필요시 수정/환경변수로 주입) =====
-VIDEO_PATH = os.getenv("APP_VIDEO_PATH", r"C:\Users\User\Desktop\GUI\W6\aimodule\KakaoTalk_20251029_133011560.mp4")
-RESULT_JSONL = os.getenv("APP_RESULT_JSONL", r"C:\Users\User\Desktop\GUI\W6\aimodule\park_clean_merged_result.jsonl")
+# ---- Auto-discover files under ./aimodule ----
+BASE_DIR = Path(__file__).resolve().parent
+AIMODULE_DIR = BASE_DIR / "aimodule"
+
+def _newest(dirpath: Path, pattern: str):
+    files = sorted(dirpath.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
+
+def _discover_paths():
+    if not AIMODULE_DIR.exists():
+        return None, None
+
+    # mp4: 최근 수정 순
+    mp4 = _newest(AIMODULE_DIR, "*.mp4")
+
+    # jsonl: *_result.jsonl 우선, 없으면 아무 *.jsonl
+    jsonls = sorted(AIMODULE_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    result_jsonl = next((p for p in jsonls if p.name.endswith("_result.jsonl")), None) or (jsonls[0] if jsonls else None)
+
+    return (str(mp4) if mp4 else None), (str(result_jsonl) if result_jsonl else None)
+
+# 우선순위: 환경변수 > 자동탐색
+VIDEO_PATH = os.getenv("APP_VIDEO_PATH")
+RESULT_JSONL = os.getenv("APP_RESULT_JSONL")
+if not VIDEO_PATH or not RESULT_JSONL:
+    _mp4, _jsonl = _discover_paths()
+    VIDEO_PATH = VIDEO_PATH or (_mp4 or "")
+    RESULT_JSONL = RESULT_JSONL or (_jsonl or "")
+
+# decisions 파일 경로 (= result 프리픽스 따름)
+if RESULT_JSONL:
+    name = Path(RESULT_JSONL).name
+    if name.endswith("_result.jsonl"):
+        prefix = name[:-len("_result.jsonl")]
+    else:
+        prefix = Path(RESULT_JSONL).stem
+    DECISIONS_JSONL = str(Path(RESULT_JSONL).with_name(f"{prefix}_decisions.jsonl"))
+else:
+    DECISIONS_JSONL = ""
+
 
 # decisions 파일 경로 (= result 프리픽스에 맞춰 자동 생성)
 RESULT_PREFIX = Path(RESULT_JSONL).name.replace("_result.jsonl", "").replace(".jsonl", "")
@@ -1545,8 +1582,21 @@ class FramelessWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
+    from PyQt5.QtWidgets import QMessageBox  # 보장
+
+    if not (VIDEO_PATH and Path(VIDEO_PATH).is_file()) or not (RESULT_JSONL and Path(RESULT_JSONL).is_file()):
+        QMessageBox.critical(None, "경로 오류",
+                             f"aimodule 폴더에서 mp4/jsonl 파일을 찾지 못했습니다.\n\n"
+                             f"폴더: {AIMODULE_DIR}\n"
+                             f"mp4: {VIDEO_PATH or '(없음)'}\njsonl: {RESULT_JSONL or '(없음)'}")
+        sys.exit(2)
+
+    logger.info("Using video=%s", VIDEO_PATH)
+    logger.info("Using results=%s", RESULT_JSONL)
+    logger.info("Decisions will be saved to %s", DECISIONS_JSONL)
+
     default_ratio = (16, 9)
-    w = FramelessWindow(face_source=0, ratio=default_ratio)
+    w = FramelessWindow(video_path=VIDEO_PATH, result_jsonl=RESULT_JSONL, ratio=default_ratio)
 
     # Restore maximized state AFTER creating the window
     if w.settings.value("maximized", False, type=bool):
@@ -1559,4 +1609,3 @@ if __name__ == "__main__":
  # Settings are stored under org="2025-AI-Project", app="StorageMonitorUI". Change those two strings if you want a different storage key. (At the top of the code lol)
 
  # <a target="_blank" href="https://icons8.com/icon/43725/cancel">Cancel</a> icon by <a target="_blank" href="https://icons8.com">Icons8</a>
-
