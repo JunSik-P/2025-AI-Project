@@ -3,6 +3,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import cv2
 
+import json
+from dataclasses import dataclass
+from collections import Counter, deque
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QHBoxLayout, QVBoxLayout, QGraphicsDropShadowEffect,
     QLabel, QSplitter, QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
@@ -10,11 +13,24 @@ from PyQt5.QtWidgets import (
     QLineEdit, QSpinBox, QComboBox, QFormLayout, QPlainTextEdit, QCheckBox
 )
 from PyQt5.QtGui import QIcon, QImage, QPixmap, QIcon, QImage, QPixmap, QColor, QBrush, QFont
-from PyQt5.QtCore import Qt, QPoint, QRect, QTimer, QDateTime, QEvent, QSettings
+from PyQt5.QtCore import Qt, QPoint, QRect, QTimer, QDateTime, QEvent, QSettings, QSize
 
 APP_ORG = "2025-AI-Project"
 APP_NAME = "StorageMonitorUI"
 LOG_DIR = Path.home() / ".storage_monitor_ui"
+
+# ===== 파일 경로 (필요시 수정/환경변수로 주입) =====
+VIDEO_PATH = os.getenv("APP_VIDEO_PATH", r"C:\Users\User\Desktop\GUI\W6\aimodule\KakaoTalk_20251029_133011560.mp4")
+RESULT_JSONL = os.getenv("APP_RESULT_JSONL", r"C:\Users\User\Desktop\GUI\W6\aimodule\park_clean_merged_result.jsonl")
+
+# decisions 파일 경로 (= result 프리픽스에 맞춰 자동 생성)
+RESULT_PREFIX = Path(RESULT_JSONL).name.replace("_result.jsonl", "").replace(".jsonl", "")
+DECISIONS_JSONL = str(Path(RESULT_JSONL).with_name(f"{RESULT_PREFIX}_decisions.jsonl"))
+
+# ===== 동시 인식 트리거 파라미터 =====
+HOLD_MIN_S   = 1.5   # 충족 최소 지속
+RESET_MIN_S  = 0.5   # 비충족 지속(재무장)
+FACE_SIM_THR = 0.40  # 얼굴 유사도 임계
 
 # -------- Logging setup --------
 def setup_logging(debug=False):
@@ -130,6 +146,158 @@ class AspectRatioBox(QWidget):
         y = (H - target_h) // 2
         self._child.setGeometry(x, y, target_w, target_h)
 
+@dataclass
+class FrameRec:
+    t_s: float
+    faces: list
+    items: list
+
+class ResultStream:
+    def __init__(self, path: str):
+        self.frames = []
+        if not path or not Path(path).exists():
+            logger.warning("Result JSONL not found: %s", path)
+            self.idx = 0
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                t_ms = o.get("timestamp_ms")
+                if t_ms is None:
+                    continue
+                self.frames.append(
+                    FrameRec(
+                        t_s=float(t_ms) / 1000.0,
+                        faces=o.get("faces", []) or [],
+                        items=o.get("items", []) or [],
+                    )
+                )
+        self.frames.sort(key=lambda r: r.t_s)
+        self.idx = 0
+        logger.info("Loaded %d result frames from %s", len(self.frames), path)
+
+    def reset_to_time(self, t: float):
+        lo, hi = 0, len(self.frames)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.frames[mid].t_s < t:
+                lo = mid + 1
+            else:
+                hi = mid
+        self.idx = max(0, lo - 1)
+
+    def get_state_at(self, t: float):
+        # (ok, face_name, item_class)
+        while self.idx + 1 < len(self.frames) and self.frames[self.idx + 1].t_s <= t:
+            self.idx += 1
+        if not self.frames:
+            return False, None, None
+        fr = self.frames[self.idx]
+
+        # 얼굴 대표(최고 similarity, Unknown 제외, 임계 이상)
+        best = None
+        for f in fr.faces:
+            name = str(f.get("person_id", "") or "").strip()
+            sim = float(f.get("similarity", 0.0))
+            if name and name.lower() != "unknown" and sim >= FACE_SIM_THR:
+                if best is None or sim > best[1]:
+                    best = (name, sim)
+        face_name = best[0] if best else None
+
+        # 품목 대표(Unknown 제외 첫 후보)
+        item_class = None
+        for it in fr.items:
+            cls = str(it.get("class_name", "") or "").strip()
+            if cls and cls.lower() != "unknown":
+                item_class = cls
+                break
+
+        ok = (face_name is not None) and (item_class is not None)
+        return ok, face_name, item_class
+
+class DecisionDialog(QDialog):
+    def __init__(self, person: str, item: str, t_s: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("이벤트 분류")
+        self.choice = None
+        form = QFormLayout()
+        form.addRow("시간(초)", QLabel(f"{t_s:.2f}"))
+        form.addRow("이름", QLabel(person or "(미확정)"))
+        form.addRow("품목", QLabel(item or "(미확정)"))
+        btn_issue  = QPushButton("불출")
+        btn_return = QPushButton("반납")
+        btn_skip   = QPushButton("건너뛰기")
+        btn_issue.clicked.connect(lambda: self._set_choice("불출"))
+        btn_return.clicked.connect(lambda: self._set_choice("반납"))
+        btn_skip.clicked.connect(self.reject)
+        row = QHBoxLayout(); row.addWidget(btn_issue); row.addWidget(btn_return); row.addWidget(btn_skip)
+        lay = QVBoxLayout(self); lay.addLayout(form); lay.addLayout(row)
+    def _set_choice(self, c):
+        self.choice = c; self.accept()
+
+class VideoPlayer(QWidget):
+    def __init__(self, video_path: str, title="입력 영상", aspect_ratio=(9, 16)):
+        super().__init__()
+        self.title = title
+        self.aspect_ratio = aspect_ratio
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap or not self.cap.isOpened():
+            raise RuntimeError(f"영상 열기 실패: {video_path}")
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        self.title_label = QLabel(self.title)
+        self.view = QLabel("영상 로딩 중…"); self.view.setAlignment(Qt.AlignCenter); self.view.setMinimumSize(240, 135)
+        self.fps_label = QLabel("FPS: --", self.view); self.fps_label.hide()
+
+        self.ar = AspectRatioBox(ratio=aspect_ratio, child=self.view, parent=self)
+        lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(6)
+        lay.addWidget(self.title_label); lay.addWidget(self.ar, 1)
+
+        self._last_pixmap = None; self._show_fps = False; self._last_times = []
+        self.playing = True; self.frame_idx = 0
+        self.timer = QTimer(self); self.timer.timeout.connect(self._on_tick)
+        self.timer.start(max(1, int(1000 / (self.fps or 30))))
+
+    def sizeHint(self): return QSize(540, 960)
+    def time_s(self):   return (self.frame_idx / self.fps) if self.fps > 0 else 0.0
+    def set_aspect_ratio(self, rw, rh): self.aspect_ratio = (rw, rh); self.ar.set_ratio(rw, rh); self._render_scaled()
+    def set_theme(self, colors):
+        self.title_label.setStyleSheet(f"font-weight:600; color:{colors['text']}; padding:6px;")
+        self.view.setStyleSheet(f"background:{colors['cam_bg']}; border:1px solid {colors['border']}; border-radius:8px;")
+    def set_show_fps(self, enabled): self._show_fps = enabled; self.fps_label.setVisible(enabled); self._last_times.clear()
+    def pause(self):  self.playing = False; self.timer.stop()
+    def play(self):   self.playing = True;  self.timer.start(max(1, int(1000 / (self.fps or 30))))
+    def restart(self): self.timer.stop(); self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0); self.frame_idx = 0; self.play()
+    def _on_tick(self):
+        if not self.playing: return
+        if self.frame_idx >= self.nframes: self.pause(); return
+        self.frame_idx += 1; self._read_and_show()
+    def _read_and_show(self):
+        ok, frame = self.cap.read()
+        if not ok: self.pause(); return
+        if self.aspect_ratio == (9,16) and frame.shape[1] > frame.shape[0]:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h,w,ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, w*ch, QImage.Format_RGB888)
+        self._last_pixmap = QPixmap.fromImage(qimg); self._render_scaled()
+        if self._show_fps:
+            now = time.time(); self._last_times.append(now)
+            while self._last_times and now - self._last_times[0] > 1.0: self._last_times.pop(0)
+            self.fps_label.setText(f"FPS: {len(self._last_times):02d}")
+    def _render_scaled(self):
+        if self._last_pixmap is None: return
+        self.view.setPixmap(self._last_pixmap.scaled(self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+    def closeEvent(self, e):
+        try: self.timer.stop(); self.cap.release()
+        finally: super().closeEvent(e)
 
 # --- Camera widget: resizes with window, image keeps aspect ratio; debug FPS overlay ---
 class CameraFeed(QWidget):
@@ -444,7 +612,7 @@ class FramelessWindow(QWidget):
     MIN_W = 800
     MIN_H = 480
 
-    def __init__(self, face_source=0, item_source=1, ratio=(16, 9)):
+    def __init__(self, face_source=0, ratio=(16, 9)):
         super().__init__()
         self._log = logging.getLogger(f"{APP_NAME}.Window")
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -539,11 +707,11 @@ class FramelessWindow(QWidget):
         self.ratio_menu.addSeparator()
         self.ratio_menu.addAction(self.action_ratio_custom)
 
-        # Debug submenu (unchanged items, just not nested under Theme anymore)
+        # Debug submenu
         self.debug_menu = QMenu("Debug", self.settings_menu)
         self.action_debug_logs = QAction("Enable debug logging", self, checkable=True)
         self.action_show_fps  = QAction("Show FPS overlay", self, checkable=True)
-        self.action_restart_cams = QAction("Restart cameras", self)
+        self.action_restart_cams = QAction("Restart video", self)  # text updated (single camera)
         self.action_dump_settings = QAction("Dump settings to log", self)
         self.action_open_debug_console = QAction("Open debug console…", self)
         # Inventory debug tools
@@ -583,7 +751,9 @@ class FramelessWindow(QWidget):
         # Debug actions (reuse your existing handlers)
         self.action_debug_logs.toggled.connect(self._on_toggle_debug)
         self.action_show_fps.toggled.connect(self._on_toggle_fps)
-        self.action_restart_cams.triggered.connect(self._on_restart_cameras)
+        self.action_restart_cams.setText("Restart video")
+        self.action_restart_cams.triggered.disconnect()
+        self.action_restart_cams.triggered.connect(self._on_restart_video)
         self.action_dump_settings.triggered.connect(self._on_dump_settings)
         self.action_open_debug_console.triggered.connect(self._open_debug_console)
         self._debug_console = None
@@ -591,8 +761,6 @@ class FramelessWindow(QWidget):
         self.action_rebuild_counts.triggered.connect(self._rebuild_counts_from_log)
         self.action_clear_counts.triggered.connect(self._clear_counts)
         self.action_seed_counts.triggered.connect(self._seed_counts_prompt)
-
-
 
         # Right: Min/Max/Close
         self.min_button = QPushButton("")
@@ -648,7 +816,6 @@ class FramelessWindow(QWidget):
         self.action_notif_mark_read.triggered.connect(self._on_mark_all_read)
         self.action_notif_clear.triggered.connect(self._on_clear_notifications)
 
-
         # Inventory table button (next to Notifications)
         self.inventory_button = QPushButton("")
         self.inventory_button.setObjectName("invBtn")
@@ -658,7 +825,6 @@ class FramelessWindow(QWidget):
 
         self._inventory_dialog = None
         self.item_counts = {}  # item -> count (int)
-
 
         # --- Top bar (draggable in empty area) ---
         self.top_bar_widget = TopBar(self)
@@ -672,16 +838,14 @@ class FramelessWindow(QWidget):
         self.top_bar_layout.addWidget(self.fullsize_button)
         self.top_bar_layout.addWidget(self.close_button)
 
-        # --- Content: Cameras + Log ---
-        self.face_cam = CameraFeed(face_source, "안면 인식 카메라", aspect_ratio=ratio)
-        self.item_cam = CameraFeed(item_source, "품목 인식 카메라", aspect_ratio=ratio)
+        # --- Content: Single Camera + Log ---
+        self.player = VideoPlayer(VIDEO_PATH, title="입력 영상", aspect_ratio=ratio)
 
         cameras_col = QWidget()
         cam_layout = QVBoxLayout(cameras_col)
         cam_layout.setContentsMargins(8, 8, 8, 8)
         cam_layout.setSpacing(8)
-        cam_layout.addWidget(self.face_cam, 1)
-        cam_layout.addWidget(self.item_cam, 1)
+        cam_layout.addWidget(self.player, 1)
         cameras_col.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.log_table = QTableWidget(0, 5)
@@ -752,6 +916,91 @@ class FramelessWindow(QWidget):
             self._log.info("Environment: PyQt5=%s, OpenCV=%s", PyQt5.QtCore.QT_VERSION_STR, cv2.__version__)
         except Exception:
             pass
+    
+        # JSONL 스트림 준비
+        self.stream = ResultStream(RESULT_JSONL)
+
+        # 상태 머신 변수
+        self.hold_acc_s = 0.0
+        self.reset_acc_s = 0.0
+        self.armed = True
+        self.last_t = 0.0
+        self.window_names = deque(maxlen=90)
+        self.window_items = deque(maxlen=90)
+
+        # 30ms 주기 UI 타이머
+        self.ui_timer = QTimer(self)
+        self.ui_timer.timeout.connect(self._on_tick)
+        self.ui_timer.start(30)
+
+    def _on_tick(self):
+        t = self.player.time_s()
+        dt = max(0.0, t - self.last_t)
+        self.last_t = t
+        ok, name, item = self.stream.get_state_at(t)
+
+        if ok:
+            self.hold_acc_s += dt
+            self.reset_acc_s = 0.0
+            if name: self.window_names.append(name)
+            if item: self.window_items.append(item)
+            if self.armed and self.hold_acc_s >= HOLD_MIN_S:
+                rep_name = self._mode(self.window_names) or (name or "Unknown")
+                rep_item = self._mode(self.window_items) or (item or "Unknown")
+                logger.info("Trigger @ %.2fs  name=%s  item=%s", t, rep_name, rep_item)
+                self._trigger_modal(t, rep_name, rep_item)
+        else:
+            self.reset_acc_s += dt
+            if self.reset_acc_s >= RESET_MIN_S:
+                self.armed = True
+                self.hold_acc_s = 0.0
+                self.window_names.clear(); self.window_items.clear()
+
+    def _mode(self, dq):
+        if not dq: return None
+        return Counter(dq).most_common(1)[0][0]
+
+    def _trigger_modal(self, t_s: float, person: str, item: str):
+        self.player.pause()
+        self.armed = False
+        dlg = DecisionDialog(person, item, t_s, parent=self)
+        if dlg.exec_() == QDialog.Accepted and dlg.choice:
+            self._append_decision(t_s, person, item, dlg.choice)
+        self.player.play()
+
+    def _format_ts_text(self, t_s: float) -> str:
+        # (요구사항) 로그에 영상 기준 타임스탬프 반영
+        ms = int(round(t_s * 1000))
+        s, ms = divmod(ms, 1000)
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+    def _append_decision(self, t_s: float, person: str, item: str, action: str):
+        # decisions.jsonl에 기록
+        rec = {
+            "timestamp_s": round(t_s, 3),
+            "person_name": person,
+            "item_class": item,
+            "action": action,
+        }
+        try:
+            with open(DECISIONS_JSONL, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            QMessageBox.critical(self, "쓰기 오류", f"decisions 저장 실패: {e}")
+            return
+
+        # 로그 테이블: 현재 시각으로 표시
+        self.add_log(person, action, item, count=1)
+
+    def _on_restart_video(self):
+        self._log.info("Restarting video by user request.")
+        self.player.restart()
+        # 상태 머신 초기화
+        self.hold_acc_s = 0.0; self.reset_acc_s = 0.0; self.armed = True; self.last_t = 0.0
+        self.window_names.clear(); self.window_items.clear()
+        if hasattr(self, "stream"): self.stream.reset_to_time(0.0)
 
     def _apply_edge_to_edge(self):
         edge = self.isMaximized()  # treat maximized as fullscreen
@@ -1023,8 +1272,7 @@ class FramelessWindow(QWidget):
         radius = 0 if self.isMaximized() else 15
         self.container.setStyleSheet(self._container_styles(c, radius))
         self.top_bar_widget.set_theme(c, radius)
-        self.face_cam.set_theme(c)
-        self.item_cam.set_theme(c)
+        self.player.set_theme(c)
         self._log.info("Applied theme: %s", name)
 
         # Keep debug console and inventory dialog themed too
@@ -1032,7 +1280,6 @@ class FramelessWindow(QWidget):
             self._debug_console.apply_theme(c)
         if hasattr(self, "_inventory_dialog") and self._inventory_dialog:
             self._inventory_dialog.apply_theme(c)
-
 
         # Repaint existing alert rows to match theme
         for r in range(self.log_table.rowCount()):
@@ -1045,9 +1292,8 @@ class FramelessWindow(QWidget):
 
     def _apply_ratio(self, ratio_tuple, update_menu_checks=False):
         rw, rh = ratio_tuple
-        # apply to both cameras
-        self.face_cam.set_aspect_ratio(rw, rh)
-        self.item_cam.set_aspect_ratio(rw, rh)
+        # apply to single camera
+        self.player.set_aspect_ratio(rw, rh)
         # persist
         self.settings.setValue("ratio", ratio_to_text((rw, rh)))
         self._log.info("Aspect ratio set to %s", ratio_to_text((rw, rh)))
@@ -1082,13 +1328,11 @@ class FramelessWindow(QWidget):
 
     def _on_toggle_fps(self, enabled: bool):
         self.settings.setValue("showFps", enabled)
-        self.face_cam.set_show_fps(enabled)
-        self.item_cam.set_show_fps(enabled)
+        self.player.set_show_fps(enabled)
 
     def _on_restart_cameras(self):
-        self._log.info("Restarting both cameras by user request.")
-        self.face_cam.restart()
-        self.item_cam.restart()
+        self._log.info("Restarting camera by user request.")
+        self.player.restart()
 
     def _on_dump_settings(self):
         keys = ["theme", "debugEnabled", "showFps", "geometry", "splitterSizes", "maximized"]
@@ -1106,6 +1350,7 @@ class FramelessWindow(QWidget):
         count_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.log_table.setItem(row, 4, count_item)
         self.log_table.scrollToBottom()
+        # 이하 기존 강조/인벤토리 갱신 로직 그대로 유지
         self._log.debug("Log row: %s | %s | %s | %s", ts, user, action, item)
 
         # highlight alerts (Action or Item equals "경고!" or action == "Alert")
@@ -1292,9 +1537,8 @@ class FramelessWindow(QWidget):
         self.settings.setValue("maximized", self.isMaximized())
         self.settings.setValue("splitterSizes", self.splitter.sizes())
         self._log.info("Saved geometry/maximized/splitter. Closing.")
-        # Stop cameras
-        self.face_cam.stop()
-        self.item_cam.stop()
+        # Stop camera
+        self.player.close()
         super().closeEvent(event)
 
 
@@ -1302,7 +1546,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     default_ratio = (16, 9)
-    w = FramelessWindow(face_source=0, item_source=1, ratio=default_ratio)
+    w = FramelessWindow(face_source=0, ratio=default_ratio)
 
     # Restore maximized state AFTER creating the window
     if w.settings.value("maximized", False, type=bool):
@@ -1310,11 +1554,9 @@ if __name__ == "__main__":
     else:
         w.show()
 
-    # Example:
-    # w.add_log("Alice", "Deposit", "Box-A", 3)
-
     sys.exit(app.exec_())
 
  # Settings are stored under org="2025-AI-Project", app="StorageMonitorUI". Change those two strings if you want a different storage key. (At the top of the code lol)
 
  # <a target="_blank" href="https://icons8.com/icon/43725/cancel">Cancel</a> icon by <a target="_blank" href="https://icons8.com">Icons8</a>
+
