@@ -1018,7 +1018,7 @@ class FramelessWindow(QWidget):
     def _append_decision(self, t_s: float, person: str, item: str, action: str):
         # decisions.jsonl에 기록
         rec = {
-            "timestamp_s": round(t_s, 3),
+            "timestamp_s": QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm:ss"),
             "person_name": person,
             "item_class": item,
             "action": action,
@@ -1611,3 +1611,4 @@ if __name__ == "__main__":
  # Settings are stored under org="2025-AI-Project", app="StorageMonitorUI". Change those two strings if you want a different storage key. (At the top of the code lol)
 
  # <a target="_blank" href="https://icons8.com/icon/43725/cancel">Cancel</a> icon by <a target="_blank" href="https://icons8.com">Icons8</a>
+
