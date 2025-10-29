@@ -649,8 +649,10 @@ class FramelessWindow(QWidget):
     MIN_W = 800
     MIN_H = 480
 
-    def __init__(self, face_source=0, ratio=(16, 9)):
+    def __init__(self, video_path=None, result_jsonl=None, ratio=(9, 16)):
         super().__init__()
+        self.video_path = video_path or VIDEO_PATH
+        self.result_jsonl = result_jsonl or RESULT_JSONL
         self._log = logging.getLogger(f"{APP_NAME}.Window")
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -876,7 +878,7 @@ class FramelessWindow(QWidget):
         self.top_bar_layout.addWidget(self.close_button)
 
         # --- Content: Single Camera + Log ---
-        self.player = VideoPlayer(VIDEO_PATH, title="입력 영상", aspect_ratio=ratio)
+        self.player = VideoPlayer(self.video_path, title="입력 영상", aspect_ratio=ratio)
 
         cameras_col = QWidget()
         cam_layout = QVBoxLayout(cameras_col)
@@ -955,7 +957,7 @@ class FramelessWindow(QWidget):
             pass
     
         # JSONL 스트림 준비
-        self.stream = ResultStream(RESULT_JSONL)
+        self.stream = ResultStream(self.result_jsonl)
 
         # 상태 머신 변수
         self.hold_acc_s = 0.0
